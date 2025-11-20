@@ -1,6 +1,8 @@
+# ---------------------------------------------------------
+# Terraform Configuration & Provider
+# ---------------------------------------------------------
 terraform {
   required_version = ">= 1.0"
-  
   required_providers {
     aws = {
       source  = "hashicorp/aws"
@@ -9,138 +11,128 @@ terraform {
   }
 }
 
-# Variables configured through Terraform Cloud UI (no-code)
-variable "project_name" {
-  description = "Name of the project"
-  type        = string
-  default     = "demo-project"
-}
-
-variable "environment" {
-  description = "Environment name"
-  type        = string
-  default     = "dev"
-}
-
-variable "aws_region" {
-  description = "AWS region"
-  type        = string
-  default     = "us-east-1"
-}
-
-variable "vpc_cidr" {
-  description = "CIDR block for VPC"
-  type        = string
-  default     = "10.0.0.0/16"
-}
-
-variable "enable_nat_gateway" {
-  description = "Enable NAT Gateway for private subnets"
-  type        = bool
-  default     = false
-}
-
-# Provider configuration
 provider "aws" {
   region = var.aws_region
 }
 
-# VPC
-resource "aws_vpc" "main" {
-  cidr_block           = var.vpc_cidr
-  enable_dns_hostnames = true
-  enable_dns_support   = true
+# ---------------------------------------------------------
+# Input Variables (Visible in No-Code UI)
+# ---------------------------------------------------------
+variable "bucket_name" {
+  description = "Name of the S3 bucket (Must be globally unique)"
+  type        = string
+  default     = "wxo-mcp-bucket"
+}
+
+variable "aws_region" {
+  description = "AWS Region to deploy into"
+  type        = string
+  default     = "us-east-2"
+}
+
+variable "environment" {
+  description = "Environment tag (e.g. demo, prod)"
+  type        = string
+  default     = "demo"
+}
+
+variable "enable_versioning" {
+  description = "Enable versioning for the bucket"
+  type        = bool
+  default     = false
+}
+
+variable "enable_encryption" {
+  description = "Enable default encryption (AES256)"
+  type        = bool
+  default     = true
+}
+
+# ---------------------------------------------------------
+# Resources
+# ---------------------------------------------------------
+
+# 1. S3 Bucket
+resource "aws_s3_bucket" "demo_bucket" {
+  bucket = var.bucket_name
+  
+  # Force destroy allows deleting the bucket even if it has files (Useful for Demos)
+  force_destroy = true
 
   tags = {
-    Name        = "${var.project_name}-${var.environment}-vpc"
+    Name        = var.bucket_name
     Environment = var.environment
-    ManagedBy   = "Terraform"
+    ManagedBy   = "Terraform-No-Code"
   }
 }
 
-# Internet Gateway
-resource "aws_internet_gateway" "main" {
-  vpc_id = aws_vpc.main.id
+# 2. Versioning
+resource "aws_s3_bucket_versioning" "demo_bucket" {
+  bucket = aws_s3_bucket.demo_bucket.id
 
-  tags = {
-    Name        = "${var.project_name}-${var.environment}-igw"
-    Environment = var.environment
+  versioning_configuration {
+    status = var.enable_versioning ? "Enabled" : "Suspended"
   }
 }
 
-# Public Subnet
-resource "aws_subnet" "public" {
-  vpc_id                  = aws_vpc.main.id
-  cidr_block              = cidrsubnet(var.vpc_cidr, 8, 1)
-  availability_zone       = data.aws_availability_zones.available.names[0]
-  map_public_ip_on_launch = true
+# 3. Encryption
+resource "aws_s3_bucket_server_side_encryption_configuration" "demo_bucket" {
+  count  = var.enable_encryption ? 1 : 0
+  bucket = aws_s3_bucket.demo_bucket.id
 
-  tags = {
-    Name        = "${var.project_name}-${var.environment}-public-subnet"
-    Environment = var.environment
+  rule {
+    apply_server_side_encryption_by_default {
+      sse_algorithm = "AES256"
+    }
   }
 }
 
-# Private Subnet
-resource "aws_subnet" "private" {
-  vpc_id            = aws_vpc.main.id
-  cidr_block        = cidrsubnet(var.vpc_cidr, 8, 2)
-  availability_zone = data.aws_availability_zones.available.names[0]
+# 4. Public Access Block (Security)
+resource "aws_s3_bucket_public_access_block" "demo_bucket" {
+  bucket = aws_s3_bucket.demo_bucket.id
 
-  tags = {
-    Name        = "${var.project_name}-${var.environment}-private-subnet"
-    Environment = var.environment
+  block_public_acls       = true
+  block_public_policy     = true
+  ignore_public_acls      = true
+  restrict_public_buckets = true
+}
+
+# 5. Lifecycle Rule (Cleanup)
+resource "aws_s3_bucket_lifecycle_configuration" "demo_bucket" {
+  bucket = aws_s3_bucket.demo_bucket.id
+
+  rule {
+    id     = "expire-old-objects"
+    status = "Enabled"
+
+    expiration {
+      days = 90
+    }
+
+    # We only add this rule if versioning is actually enabled
+    dynamic "noncurrent_version_expiration" {
+      for_each = var.enable_versioning ? [1] : []
+      content {
+        noncurrent_days = 30
+      }
+    }
   }
 }
 
-# Public Route Table
-resource "aws_route_table" "public" {
-  vpc_id = aws_vpc.main.id
-
-  route {
-    cidr_block = "0.0.0.0/0"
-    gateway_id = aws_internet_gateway.main.id
-  }
-
-  tags = {
-    Name        = "${var.project_name}-${var.environment}-public-rt"
-    Environment = var.environment
-  }
+# ---------------------------------------------------------
+# Outputs (Returned to the UI)
+# ---------------------------------------------------------
+output "bucket_name" {
+  description = "Name of the S3 bucket created"
+  value       = aws_s3_bucket.demo_bucket.id
 }
 
-# Public Route Table Association
-resource "aws_route_table_association" "public" {
-  subnet_id      = aws_subnet.public.id
-  route_table_id = aws_route_table.public.id
+output "bucket_arn" {
+  description = "ARN of the S3 bucket"
+  value       = aws_s3_bucket.demo_bucket.arn
 }
 
-# Data source for availability zones
-data "aws_availability_zones" "available" {
-  state = "available"
-}
-
-# Outputs
-output "vpc_id" {
-  description = "ID of the VPC"
-  value       = aws_vpc.main.id
-}
-
-output "vpc_cidr" {
-  description = "CIDR block of the VPC"
-  value       = aws_vpc.main.cidr_block
-}
-
-output "public_subnet_id" {
-  description = "ID of the public subnet"
-  value       = aws_subnet.public.id
-}
-
-output "private_subnet_id" {
-  description = "ID of the private subnet"
-  value       = aws_subnet.private.id
-}
-
-output "internet_gateway_id" {
-  description = "ID of the Internet Gateway"
-  value       = aws_internet_gateway.main.id
+output "bucket_region" {
+  description = "Region where bucket is created"
+  value       = aws_s3_bucket.demo_bucket.region
 }
